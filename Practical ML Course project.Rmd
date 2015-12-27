@@ -1,0 +1,262 @@
+---
+title: "Practical ML Course project"
+author: "Aleksandr Beloushkin (aka gudun-ku)"
+date: "December 27, 2015"
+output: html_document
+---
+
+
+# Introduction and background
+
+  Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement – a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. This project trying to find recognizable patterns and check their validity
+in case of prediction kinds of exercises using given data from these devices. 
+
+
+# The gist
+
+  The goal of this project is to predict the manner in which people in test group did the exercise. The "classe" variable in the training set provides information about exercises connected with registered activities. It is allowed to use any of the other variables to predict with. This document represent description about model selection,how it was built usage of the validation,expected out of sample error,and foundations for choices done.
+
+
+# The data
+
+  Dataset contain records from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+  The training data for this project are available here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+  The test data are available here: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+  The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+# Building models 
+
+## Needed packages
+
+```{r, message = FALSE}
+library(caret)
+library(gbm)
+library(plyr)
+library(knitr)
+library(pander)
+panderOptions('table.split.table', Inf)
+```
+
+
+## Loading the data
+
+  While loading we need to perform some work to recognize NA values. So we doing
+using option na.strings during reading csv files. Files were already downloaded.
+
+```{r}
+train_file <- paste0(getwd(),"/", "pml-training",".csv")
+test_file <- paste0(getwd(),"/", "pml-testing",".csv")
+train <- read.csv(train_file, na.strings=c("NA","#DIV/0!",""), stringsAsFactors = FALSE)
+test<- read.csv(test_file, na.strings=c("NA","#DIV/0!",""),
+stringsAsFactors = FALSE)
+```
+
+  To evaluate models we need to make both training and testing sets from 
+our big training set provided by HAR. Caret allows to do it easily. Here we would 
+use dividing our data by 70/30 proportion from which 70 percent will be training
+and remain 30 will be testing data to evaluate models. 
+
+```{r}
+set.seed(3224)
+inTrain <- createDataPartition(train$classe, p=0.7, list=FALSE)
+training <- train[inTrain, ]
+testing <- train[-inTrain, ]
+dim(training); dim(testing)
+```
+
+
+## Initial data exploration
+
+  We need to analyze our data in order to check its cleaness tidyness as being
+prepared before using any of the machine learning techniques. We know that most
+classifiers wouldn't work perfect if we have a lot of na or near zero values in 
+our data. Thus firstly we need to analyze the data and do steps to make it 
+more suitable. For analysis we use training dataset. 
+  To get a better view of data we can make short table with classes, count of NA variables
+and mean and sd for each variable. 
+
+```{r render=pander, results='asis',warning= FALSE,}
+training_props <- as.data.frame(colnames(training))
+training_props$class <-sapply(training, function(y) class(y))
+training_props$na_count <-sapply(training, function(y) sum(length(which(is.na(y)))))
+training_props$na_percent <-sapply(training, function(y) 100* sum(length(which(is.na(y))))/sum(length(y)))
+training_props$mean <-sapply(training, function(y) {if (class(y) %in% c("integer","numeric")) mean(y, na.rm = TRUE) else NA})
+training_props$sd <-sapply(training, function(y) {if (class(y) %in% c("integer","numeric")) sd(y,na.rm = TRUE) else NA})
+
+training_props
+```
+
+From this table we can see that before using any machine learning algorithm we need to remove or impute na values, remove zero values, remove values with very low variance ("near zero variance values") and normalize the data. 
+
+## Cleaning the data
+
+### Delete variables containing too much NA values
+Firstly we decide to remove all columns that contain more than 99% of NA's. 
+We must not change classe variable so we put it in temp storage
+
+```{r}
+temp_classe <- training$classe
+na_cols <- c(training_props[training_props$na_percent > 99,][,1])
+training <- training[,-na_cols]
+testing <- testing[,-na_cols]
+## real test
+test <- test[,-na_cols]
+
+## udpate training props
+training_props <- training_props[-na_cols,]
+```
+
+### Imputing NA values
+
+  We might use some advanced strategies to impute NA values like provided in
+ImputeR package, but characteristics of variables containing these values allow to try 
+just impute column means instead of na's. But some variables are factors and they 
+will not allow to calculate their means. Thus before imputing we change our 
+factor variables to integers assuming logical and factor variables are categorical & replacing them with numeric ids.
+
+```{r}
+feature.names <- names(training)[2:(ncol(training)-1)]
+
+for (f in feature.names) {
+  if (class(training[[f]])=="character" || class(training[[f]])=="logical") {
+    levels <- unique(c(training[[f]], testing[[f]]))
+    training[[f]] <- as.numeric(factor(training[[f]], levels=levels))
+    testing[[f]] <- as.numeric(factor(testing[[f]], levels=levels))
+    test[[f]] <- as.numeric(factor(test[[f]], levels=levels))
+  }
+}
+```
+
+now we are ready to impute na values using medianImpute
+
+```{r, warning=FALSE}
+non_na_cols <- c(training_props[training_props$na_percent == 0,][,1])
+pre<-preProcess(training[,-non_na_cols], method="medianImpute",na.remove = TRUE)
+training[,-non_na_cols] <-predict(pre, training[,-non_na_cols])
+pre<-preProcess(testing[,-non_na_cols], method="medianImpute",na.remove = TRUE)
+testing[,-non_na_cols] <-predict(pre, testing[,-non_na_cols])
+pre<-preProcess(test[,-non_na_cols], method="medianImpute",na.remove = TRUE)
+test[,-non_na_cols] <-predict(pre, test[,-non_na_cols])
+## other na values we're zeroing
+
+training[is.na(training)] <- 0
+testing[is.na(testing)] <- 0
+test[is.na(test)] <- 0
+```
+
+### Removing columns with near zero variance
+
+```{r}
+nzv <- nearZeroVar(training, saveMetrics=TRUE)
+training <- training[,nzv$nzv==FALSE]
+nzv<- nearZeroVar(testing,saveMetrics=TRUE)
+testing <- testing[,nzv$nzv==FALSE]
+nzv<- nearZeroVar(test,saveMetrics=TRUE)
+test <- test[,nzv$nzv==FALSE]
+```
+
+### Restoring the order
+
+```{r}
+training <- training[order(training$X),]
+testing <- testing[order(testing$X),]
+training$classe <- as.factor(training$classe)
+testing$classe <- as.factor(testing$classe)
+# set features columns into a feature.names variable
+feature.names <- names(training)[3:(ncol(training)-1)]
+```
+
+## Predicting with different models
+
+Because simple models in classification don't provide great results we omit tryings to build a model with linear regression and decision trees. As to support vector machines and deep learning
+we might try to built some models but despite possibly accuracy we may not expect them to 
+be quick in the learning stage. So I decided to use two models included in caret package - 
+Gradient Boosting Machine and Random Forests and compare them in perfomance
+
+### Prediction using Generalized boosting regression
+
+```{r}
+set.seed(33224)
+modelControl <- trainControl(method = "repeatedcv",
+                           number = 5,
+                           repeats = 1)
+
+gbm_model <- train(x = training[,c(feature.names)],
+                   y = training$classe, 
+                   method = "gbm",
+                   trControl = modelControl,
+                   verbose = FALSE)
+
+
+gbm_final <- gbm_model$finalModel
+
+gbm_predictions <- predict(gbm_model, newdata=testing[,c(feature.names)])
+gbm_accuracy <- confusionMatrix(gbm_predictions, testing$classe)
+gbm_accuracy
+```
+
+We can plot our model using gbm plot function implementation. 
+
+```{r}
+plot(gbm_model, ylim=c(0.9, 1))
+```
+
+### Prediction with Random Forests
+
+  Random forest is a very useful and powerful model to use in classification tasks from which
+we can expect a better perfomance. Let's check this on our data. 
+
+```{r}
+library(randomForest)
+set.seed(33234)
+model_rf <- randomForest(x = training[,c(feature.names)],y = training$classe)
+predictions_rf <- predict(model_rf, testing, type = "class")
+cm_rf <- confusionMatrix(predictions_rf, testing$classe)
+cm_rf
+```
+
+Random Forests package has its own implementation of plot function allowing us to 
+plot model characteristics
+ 
+```{r}
+plot(model_rf)
+```
+
+### Results of testing different models
+
+#### table here should be
+
+For our case Random forest achieved the best result, so I would use it in prediction task. 
+
+##Generating Files to submit assigment test files 
+
+  To derive out-of-sample error we will use provided test set. In our example 
+the expected out-of-sample error is 100-99.93 = 0.07%.
+
+```{r}
+predictions <- predict(model_rf, test, type = "class")
+predictions
+```
+
+To generate assigment files I would use simple function like presented
+
+```{r}
+generate_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+generate_files(predictions)
+```
+
+# Appendix. Software and environment
+
+```{r, echo = FALSE}
+sessionInfo()
+```
